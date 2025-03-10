@@ -17,11 +17,15 @@ from utils.utils_callbacks import CallBackLogging, CallBackVerification
 from utils.utils_config import get_config
 from utils.utils_logging import AverageMeter, init_logging
 from utils.utils_distributed_sampler import setup_seed
+from utils.utils_distributed_sampler import get_dist_info
 
 from torchvision import transforms
 from FFT import amplitude_spectrum_mix
 import random
-assert torch.__version__ >= "1.9.0", "In order to enjoy the features of the new torch, \
+
+assert (
+    torch.__version__ >= "1.9.0"
+), "In order to enjoy the features of the new torch, \
 we have upgraded the torch to 1.9.0. torch before than 1.9.0 may not work in the future."
 
 try:
@@ -33,7 +37,7 @@ except KeyError:
     rank = 0
     distributed.init_process_group(
         backend="nccl",
-        #backend="gloo",
+        # backend="gloo",
         init_method="tcp://127.0.0.1:12584",
         rank=rank,
         world_size=world_size,
@@ -50,6 +54,8 @@ def main(args):
     torch.cuda.set_device(args.local_rank)
 
     os.makedirs(cfg.output, exist_ok=True)
+    rank, world_size = get_dist_info()
+
     init_logging(rank, cfg.output)
 
     summary_writer = (
@@ -59,20 +65,25 @@ def main(args):
     )
 
     train_loader = get_dataloader(
-        cfg.rec,
-        args.local_rank,
-        cfg.batch_size,
-        cfg.dali,
-        cfg.seed,
-        cfg.num_workers
+        cfg.rec, args.local_rank, cfg.batch_size, cfg.dali, cfg.seed, cfg.num_workers
     )
 
     backbone = get_model(
-        cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).cuda()
-
+        cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size
+    ).cuda()
     backbone = torch.nn.parallel.DistributedDataParallel(
-        module=backbone, broadcast_buffers=False, device_ids=[args.local_rank], bucket_cap_mb=16,
-        find_unused_parameters=True)
+        module=backbone,
+        broadcast_buffers=False,
+        device_ids=[args.local_rank],
+        bucket_cap_mb=16,
+        find_unused_parameters=True,
+    )
+    if cfg.weight_path is not None:
+        logging.info("load weight from %s" % cfg.weight_path)
+        pretrained_weight = torch.load(
+            cfg.weight_path, map_location=torch.device("cuda", rank)
+        )
+        backbone.module.load_state_dict(pretrained_weight, strict=True)
 
     backbone.train()
     # FIXME using gradient checkpoint if there are some unused parameters will cause error
@@ -83,27 +94,38 @@ def main(args):
         cfg.margin_list[0],
         cfg.margin_list[1],
         cfg.margin_list[2],
-        cfg.interclass_filtering_threshold
+        cfg.interclass_filtering_threshold,
     )
 
     if cfg.optimizer == "sgd":
         module_partial_fc = PartialFC(
-            margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, cfg.fp16)
+            margin_loss, cfg.embedding_size, cfg.num_classes, cfg.sample_rate, cfg.fp16
+        )
         module_partial_fc.train().cuda()
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
-            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
-            lr=cfg.lr, momentum=0.9, weight_decay=cfg.weight_decay)
+            params=[
+                {"params": backbone.parameters()},
+                {"params": module_partial_fc.parameters()},
+            ],
+            lr=cfg.lr,
+            momentum=0.9,
+            weight_decay=cfg.weight_decay,
+        )
 
     elif cfg.optimizer == "adamw":
         module_partial_fc = PartialFCAdamW(
-            margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, cfg.fp16)
+            margin_loss, cfg.embedding_size, cfg.num_classes, cfg.sample_rate, cfg.fp16
+        )
         module_partial_fc.train().cuda()
         opt = torch.optim.AdamW(
-            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
-            lr=cfg.lr, weight_decay=cfg.weight_decay)
+            params=[
+                {"params": backbone.parameters()},
+                {"params": module_partial_fc.parameters()},
+            ],
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+        )
     else:
         raise
 
@@ -116,13 +138,15 @@ def main(args):
         base_lr=cfg.lr,
         max_steps=cfg.total_step,
         warmup_steps=cfg.warmup_step,
-        last_epoch=-1
+        last_epoch=-1,
     )
 
     start_epoch = 0
     global_step = 0
     if cfg.resume:
-        dict_checkpoint = torch.load(os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
+        dict_checkpoint = torch.load(
+            os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
+        )
         start_epoch = dict_checkpoint["epoch"]
         global_step = dict_checkpoint["global_step"]
         backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
@@ -142,8 +166,8 @@ def main(args):
         frequent=cfg.frequent,
         total_step=cfg.total_step,
         batch_size=cfg.batch_size,
-        start_step = global_step,
-        writer=summary_writer
+        start_step=global_step,
+        writer=summary_writer,
     )
 
     loss_am = AverageMeter()
@@ -153,46 +177,69 @@ def main(args):
 
         if isinstance(train_loader, DataLoader):
             train_loader.sampler.set_epoch(epoch)
-        for _, (img, local_labels) in enumerate(train_loader):    # sampler
+        for _, data_item in enumerate(train_loader):  # sampler
+            img, local_labels = data_item["images"], data_item["face_ids"]
             global_step += 1
             with torch.no_grad():
                 local_embeddings, weight, local_patch_entropy = backbone(img)
-                loss: torch.Tensor = module_partial_fc(local_embeddings, local_labels, opt, local_patch_entropy) 
+                loss: torch.Tensor = module_partial_fc(
+                    local_embeddings, local_labels, opt, local_patch_entropy
+                )
 
-            img_original= ( (img*0.5) + 0.5 ) * 255  #[0,255]
-            img_original = img_original.permute(0,2,3,1)  #[batch, height, width, channel]
+            img_original = ((img * 0.5) + 0.5) * 255  # [0,255]
+            img_original = img_original.permute(
+                0, 2, 3, 1
+            )  # [batch, height, width, channel]
             img_original = img_original.cpu().numpy()  #
 
             ##TopK
             K = 7
             TopK_ALL = torch.argsort(weight, dim=1, descending=True)
             TopK_ALL = TopK_ALL.cpu().numpy()
-            TopK  = TopK_ALL[:, :K]
+            TopK = TopK_ALL[:, :K]
 
             probability = 0.2
             batch_index = 0
-            
+
             for index in TopK:
                 if random.random() <= probability:
                     for j in range(TopK.shape[1]):
-                        patch_index_h = int(np.floor(index[j]/12))
-                        patch_index_w = int( (index[j] - patch_index_h * 12) )
-                        img_src = img_original[batch_index, 9*patch_index_h:9*(1+patch_index_h), 9*patch_index_w:9*(1+patch_index_w), :]
-                        random_index = int(np.random.randint(0,img.size()[0],1))
-                        random_h = int(np.random.randint(0,12,1))
-                        random_w = int(np.random.randint(0,12,1))
-                        img_random = img_original[random_index, 9*random_h:9*(1+random_h), 9*random_w:9*(1+random_w), :]
-                        img_src_random = amplitude_spectrum_mix(img_src, img_random, alpha=1)
-                        img_original[batch_index, 9*patch_index_h:9*(1+patch_index_h), 9*patch_index_w:9*(1+patch_index_w), :] = img_src_random
+                        patch_index_h = int(np.floor(index[j] / 12))
+                        patch_index_w = int((index[j] - patch_index_h * 12))
+                        img_src = img_original[
+                            batch_index,
+                            9 * patch_index_h : 9 * (1 + patch_index_h),
+                            9 * patch_index_w : 9 * (1 + patch_index_w),
+                            :,
+                        ]
+                        random_index = int(np.random.randint(0, img.size()[0], 1))
+                        random_h = int(np.random.randint(0, 12, 1))
+                        random_w = int(np.random.randint(0, 12, 1))
+                        img_random = img_original[
+                            random_index,
+                            9 * random_h : 9 * (1 + random_h),
+                            9 * random_w : 9 * (1 + random_w),
+                            :,
+                        ]
+                        img_src_random = amplitude_spectrum_mix(
+                            img_src, img_random, alpha=1
+                        )
+                        img_original[
+                            batch_index,
+                            9 * patch_index_h : 9 * (1 + patch_index_h),
+                            9 * patch_index_w : 9 * (1 + patch_index_w),
+                            :,
+                        ] = img_src_random
                 batch_index = batch_index + 1
 
             img_fft = torch.tensor(img_original).cuda()
-            img_fft = img_fft.permute(0,3,1,2)    ## [batch, channel, height, width]
-            img_fft = ( (img_fft/255) - 0.5) / (0.5)
-            
+            img_fft = img_fft.permute(0, 3, 1, 2)  ## [batch, channel, height, width]
+            img_fft = ((img_fft / 255) - 0.5) / (0.5)
 
             local_embeddings, weight, local_patch_entropy = backbone(img_fft)
-            loss: torch.Tensor = module_partial_fc(local_embeddings, local_labels, opt, local_patch_entropy)
+            loss: torch.Tensor = module_partial_fc(
+                local_embeddings, local_labels, opt, local_patch_entropy
+            )
 
             if cfg.fp16:
                 amp.scale(loss).backward()
@@ -210,7 +257,14 @@ def main(args):
 
             with torch.no_grad():
                 loss_am.update(loss.item(), 1)
-                callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
+                callback_logging(
+                    global_step,
+                    loss_am,
+                    epoch,
+                    cfg.fp16,
+                    lr_scheduler.get_last_lr()[0],
+                    amp,
+                )
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     callback_verification(global_step, backbone)
@@ -222,9 +276,11 @@ def main(args):
                 "state_dict_backbone": backbone.module.state_dict(),
                 "state_dict_softmax_fc": module_partial_fc.state_dict(),
                 "state_optimizer": opt.state_dict(),
-                "state_lr_scheduler": lr_scheduler.state_dict()
+                "state_lr_scheduler": lr_scheduler.state_dict(),
             }
-            torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
+            torch.save(
+                checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
+            )
 
         if rank == 0:
             path_module = os.path.join(cfg.output, "model.pt")
@@ -237,8 +293,13 @@ def main(args):
         path_module = os.path.join(cfg.output, "model.pt")
         torch.save(backbone.module.state_dict(), path_module)
 
-        from torch2onnx import convert_onnx
-        convert_onnx(backbone.module.cpu().eval(), path_module, os.path.join(cfg.output, "model.onnx"))
+        # from torch2onnx import convert_onnx
+
+        # convert_onnx(
+        #     backbone.module.cpu().eval(),
+        #     path_module,
+        #     os.path.join(cfg.output, "model.onnx"),
+        # )
 
     distributed.destroy_process_group()
 
@@ -246,7 +307,13 @@ def main(args):
 if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
     parser = argparse.ArgumentParser(
-        description="Distributed Arcface Training in Pytorch")
-    parser.add_argument("--config", type=str, help="py config file", default='configs/glint360k_vit_s.py')
+        description="Distributed Arcface Training in Pytorch"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="py config file",
+        default="configs/glint360k_vit_s.py",
+    )
     parser.add_argument("--local_rank", type=int, default=0, help="local_rank")
     main(parser.parse_args())
