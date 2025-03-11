@@ -18,10 +18,10 @@ config.lr = 0.0001
 config.verbose = 2000
 config.dali = False
 
-config.rec = "/home/gup/datas/glint360k_db"  # glint360k
+config.rec = "/root/glint360k_db"  # glint360k
 config.num_classes = 360232
 config.num_image = 17091657
 config.num_epoch = 40
-config.warmup_epoch = config.num_epoch // 10
+config.warmup_epoch = 4
 config.val_targets = ["lfw", "cfp_fp", "agedb_30"]
-config.weight_path = "./weights/glint360k_model_TransFace_S.pt"
+config.weight_path = "/tmp/dataset/face_rec/glint360k_model_TransFace_S.pt"

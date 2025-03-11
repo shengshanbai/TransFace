@@ -33,61 +33,77 @@ def get_dataloader(
         train_set = FaceRecDataset(root_dir=root_dir)
         dali = False
     # Synthetic
-    elif root_dir == "synthetic":
-        train_set = SyntheticDataset()
-        dali = False
-
-    # Mxnet RecordIO
-    elif os.path.exists(rec) and os.path.exists(idx):
-        train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank)
-
-    # Image Folder
-    else:
-        transform = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
-        train_set = ImageFolder(root_dir, transform)
-
-    # DALI
-    if dali:
-        return dali_data_iter(
-            batch_size=batch_size,
-            rec_file=rec,
-            idx_file=idx,
-            num_threads=2,
-            local_rank=local_rank,
-        )
-
+    #  elif root_dir == "synthetic":
+    #      train_set = SyntheticDataset()
+    #      dali = False
+    #
+    #  # Mxnet RecordIO
+    #  elif os.path.exists(rec) and os.path.exists(idx):
+    #      train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank)
+    #
+    #  # Image Folder
+    #  else:
+    #      transform = transforms.Compose(
+    #          [
+    #              transforms.RandomHorizontalFlip(),
+    #              transforms.ToTensor(),
+    #              transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    #          ]
+    #      )
+    #      train_set = ImageFolder(root_dir, transform)
+    #
+    #  # DALI
+    #  if dali:
+    #      return dali_data_iter(
+    #          batch_size=batch_size,
+    #          rec_file=rec,
+    #          idx_file=idx,
+    #          num_threads=2,
+    #          local_rank=local_rank,
+    #      )
+    #
     rank, world_size = get_dist_info()
-    train_sampler = DistributedSampler(
-        train_set, num_replicas=world_size, rank=rank, shuffle=True, seed=seed
-    )
+    #  train_sampler = DistributedSampler(train_set,
+    #                                     num_replicas=world_size,
+    #                                     rank=rank,
+    #                                     shuffle=True,
+    #                                     seed=seed)
+    if world_size > 1:
+        train_sampler = torch.utils.data.DistributedSampler(
+            train_set,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed)
+        shuffle = False
+    else:
+        train_sampler = None
+        shuffle = True
 
     if seed is None:
         init_fn = None
     else:
-        init_fn = partial(worker_init_fn, num_workers=num_workers, rank=rank, seed=seed)
+        init_fn = partial(worker_init_fn,
+                          num_workers=num_workers,
+                          rank=rank,
+                          seed=seed)
 
-    train_loader = DataLoaderX(
-        local_rank=local_rank,
-        dataset=train_set,
-        batch_size=batch_size,
-        sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-        worker_init_fn=init_fn,
-        collate_fn=train_set.train_collate_fn,
-    )
+    train_loader = DataLoaderX(local_rank=local_rank,
+                               dataset=train_set,
+                               batch_size=batch_size,
+                               sampler=train_sampler,
+                               num_workers=num_workers,
+                               pin_memory=True,
+                               drop_last=True,
+                               worker_init_fn=init_fn,
+                               collate_fn=train_set.train_collate_fn,
+                               shuffle=shuffle)
 
     return train_loader
 
 
 class BackgroundGenerator(threading.Thread):
+
     def __init__(self, generator, local_rank, max_prefetch=6):
         super(BackgroundGenerator, self).__init__()
         self.queue = Queue.Queue(max_prefetch)
@@ -135,14 +151,12 @@ class DataLoaderX(DataLoader):
         with torch.cuda.stream(self.stream):
             if isinstance(self.batch, dict):
                 for k in self.batch.keys():
-                    self.batch[k] = self.batch[k].to(
-                        device=self.local_rank, non_blocking=True
-                    )
+                    self.batch[k] = self.batch[k].to(device=self.local_rank,
+                                                     non_blocking=True)
             else:
                 for k in range(len(self.batch)):
-                    self.batch[k] = self.batch[k].to(
-                        device=self.local_rank, non_blocking=True
-                    )
+                    self.batch[k] = self.batch[k].to(device=self.local_rank,
+                                                     non_blocking=True)
 
     def __next__(self):
         torch.cuda.current_stream().wait_stream(self.stream)
@@ -154,21 +168,21 @@ class DataLoaderX(DataLoader):
 
 
 class MXFaceDataset(Dataset):
+
     def __init__(self, root_dir, local_rank):
         super(MXFaceDataset, self).__init__()
-        self.transform = transforms.Compose(
-            [
-                transforms.ToPILImage(),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
         self.root_dir = root_dir
         self.local_rank = local_rank
         path_imgrec = os.path.join(root_dir, "train.rec")
         path_imgidx = os.path.join(root_dir, "train.idx")
-        self.imgrec = mx.recordio.MXIndexedRecordIO(path_imgidx, path_imgrec, "r")
+        self.imgrec = mx.recordio.MXIndexedRecordIO(path_imgidx, path_imgrec,
+                                                    "r")
         s = self.imgrec.read_idx(0)
         header, _ = mx.recordio.unpack(s)
         if header.flag > 0:
@@ -195,6 +209,7 @@ class MXFaceDataset(Dataset):
 
 
 class SyntheticDataset(Dataset):
+
     def __init__(self):
         super(SyntheticDataset, self).__init__()
         img = np.random.randint(0, 255, size=(112, 112, 3), dtype=np.int32)
@@ -212,17 +227,17 @@ class SyntheticDataset(Dataset):
 
 
 def dali_data_iter(
-    batch_size: int,
-    rec_file: str,
-    idx_file: str,
-    num_threads: int,
-    initial_fill=32768,
-    random_shuffle=True,
-    prefetch_queue_depth=1,
-    local_rank=0,
-    name="reader",
-    mean=(127.5, 127.5, 127.5),
-    std=(127.5, 127.5, 127.5),
+        batch_size: int,
+        rec_file: str,
+        idx_file: str,
+        num_threads: int,
+        initial_fill=32768,
+        random_shuffle=True,
+        prefetch_queue_depth=1,
+        local_rank=0,
+        name="reader",
+        mean=(127.5, 127.5, 127.5),
+        std=(127.5, 127.5, 127.5),
 ):
     """
     Parameters:
@@ -256,22 +271,26 @@ def dali_data_iter(
             pad_last_batch=False,
             name=name,
         )
-        images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
-        images = fn.crop_mirror_normalize(
-            images, dtype=types.FLOAT, mean=mean, std=std, mirror=condition_flip
-        )
+        images = fn.decoders.image(jpegs,
+                                   device="mixed",
+                                   output_type=types.RGB)
+        images = fn.crop_mirror_normalize(images,
+                                          dtype=types.FLOAT,
+                                          mean=mean,
+                                          std=std,
+                                          mirror=condition_flip)
         pipe.set_outputs(images, labels)
     pipe.build()
     return DALIWarper(
         DALIClassificationIterator(
             pipelines=[pipe],
             reader_name=name,
-        )
-    )
+        ))
 
 
 @torch.no_grad()
 class DALIWarper(object):
+
     def __init__(self, dali_iter):
         self.iter = dali_iter
 

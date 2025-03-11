@@ -23,9 +23,8 @@ from torchvision import transforms
 from FFT import amplitude_spectrum_mix
 import random
 
-assert (
-    torch.__version__ >= "1.9.0"
-), "In order to enjoy the features of the new torch, \
+assert (torch.__version__
+        >= "1.9.0"), "In order to enjoy the features of the new torch, \
 we have upgraded the torch to 1.9.0. torch before than 1.9.0 may not work in the future."
 
 try:
@@ -35,13 +34,13 @@ try:
 except KeyError:
     world_size = 1
     rank = 0
-    distributed.init_process_group(
-        backend="nccl",
-        # backend="gloo",
-        init_method="tcp://127.0.0.1:12584",
-        rank=rank,
-        world_size=world_size,
-    )
+    #  distributed.init_process_group(
+    #      backend="nccl",
+    #      # backend="gloo",
+    #      init_method="tcp://127.0.0.1:12584",
+    #      rank=rank,
+    #      world_size=world_size,
+    #  )
 
 
 def main(args):
@@ -58,36 +57,38 @@ def main(args):
 
     init_logging(rank, cfg.output)
 
-    summary_writer = (
-        SummaryWriter(log_dir=os.path.join(cfg.output, "tensorboard"))
-        if rank == 0
-        else None
-    )
+    summary_writer = (SummaryWriter(
+        log_dir=os.path.join(cfg.output, "tensorboard"))
+                      if rank == 0 else None)
 
-    train_loader = get_dataloader(
-        cfg.rec, args.local_rank, cfg.batch_size, cfg.dali, cfg.seed, cfg.num_workers
-    )
+    train_loader = get_dataloader(cfg.rec, args.local_rank, cfg.batch_size,
+                                  cfg.dali, cfg.seed, cfg.num_workers)
 
-    backbone = get_model(
-        cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size
-    ).cuda()
-    backbone = torch.nn.parallel.DistributedDataParallel(
-        module=backbone,
-        broadcast_buffers=False,
-        device_ids=[args.local_rank],
-        bucket_cap_mb=16,
-        find_unused_parameters=True,
-    )
+    backbone = get_model(cfg.network,
+                         dropout=0.0,
+                         fp16=cfg.fp16,
+                         num_features=cfg.embedding_size).cuda()
+    if world_size > 1:
+        backbone = torch.nn.parallel.DistributedDataParallel(
+            module=backbone,
+            broadcast_buffers=False,
+            device_ids=[args.local_rank],
+            bucket_cap_mb=16,
+            find_unused_parameters=True,
+        )
     if cfg.weight_path is not None:
         logging.info("load weight from %s" % cfg.weight_path)
-        pretrained_weight = torch.load(
-            cfg.weight_path, map_location=torch.device("cuda", rank)
-        )
-        backbone.module.load_state_dict(pretrained_weight, strict=True)
+        pretrained_weight = torch.load(cfg.weight_path,
+                                       map_location=torch.device("cuda", rank))
+        if world_size > 1:
+            backbone.module.load_state_dict(pretrained_weight, strict=True)
+        else:
+            backbone.load_state_dict(pretrained_weight, strict=True)
 
     backbone.train()
     # FIXME using gradient checkpoint if there are some unused parameters will cause error
-    backbone._set_static_graph()
+    if world_size > 1:
+        backbone._set_static_graph()
 
     margin_loss = CombinedMarginLoss(
         64,
@@ -98,15 +99,19 @@ def main(args):
     )
 
     if cfg.optimizer == "sgd":
-        module_partial_fc = PartialFC(
-            margin_loss, cfg.embedding_size, cfg.num_classes, cfg.sample_rate, cfg.fp16
-        )
+        module_partial_fc = PartialFC(margin_loss, cfg.embedding_size,
+                                      cfg.num_classes, cfg.sample_rate,
+                                      cfg.fp16)
         module_partial_fc.train().cuda()
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
             params=[
-                {"params": backbone.parameters()},
-                {"params": module_partial_fc.parameters()},
+                {
+                    "params": backbone.parameters()
+                },
+                {
+                    "params": module_partial_fc.parameters()
+                },
             ],
             lr=cfg.lr,
             momentum=0.9,
@@ -114,14 +119,18 @@ def main(args):
         )
 
     elif cfg.optimizer == "adamw":
-        module_partial_fc = PartialFCAdamW(
-            margin_loss, cfg.embedding_size, cfg.num_classes, cfg.sample_rate, cfg.fp16
-        )
+        module_partial_fc = PartialFCAdamW(margin_loss, cfg.embedding_size,
+                                           cfg.num_classes, cfg.sample_rate,
+                                           cfg.fp16)
         module_partial_fc.train().cuda()
         opt = torch.optim.AdamW(
             params=[
-                {"params": backbone.parameters()},
-                {"params": module_partial_fc.parameters()},
+                {
+                    "params": backbone.parameters()
+                },
+                {
+                    "params": module_partial_fc.parameters()
+                },
             ],
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
@@ -145,12 +154,12 @@ def main(args):
     global_step = 0
     if cfg.resume:
         dict_checkpoint = torch.load(
-            os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
-        )
+            os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
         start_epoch = dict_checkpoint["epoch"]
         global_step = dict_checkpoint["global_step"]
         backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
-        module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
+        module_partial_fc.load_state_dict(
+            dict_checkpoint["state_dict_softmax_fc"])
         opt.load_state_dict(dict_checkpoint["state_optimizer"])
         lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
         del dict_checkpoint
@@ -159,9 +168,9 @@ def main(args):
         num_space = 25 - len(key)
         logging.info(": " + key + " " * num_space + str(value))
 
-    callback_verification = CallBackVerification(
-        val_targets=cfg.val_targets, rec_prefix=cfg.rec, summary_writer=summary_writer
-    )
+    callback_verification = CallBackVerification(val_targets=cfg.val_targets,
+                                                 rec_prefix=cfg.rec,
+                                                 summary_writer=summary_writer)
     callback_logging = CallBackLogging(
         frequent=cfg.frequent,
         total_step=cfg.total_step,
@@ -182,14 +191,13 @@ def main(args):
             global_step += 1
             with torch.no_grad():
                 local_embeddings, weight, local_patch_entropy = backbone(img)
-                loss: torch.Tensor = module_partial_fc(
-                    local_embeddings, local_labels, opt, local_patch_entropy
-                )
+                loss: torch.Tensor = module_partial_fc(local_embeddings,
+                                                       local_labels, opt,
+                                                       local_patch_entropy)
 
             img_original = ((img * 0.5) + 0.5) * 255  # [0,255]
             img_original = img_original.permute(
-                0, 2, 3, 1
-            )  # [batch, height, width, channel]
+                0, 2, 3, 1)  # [batch, height, width, channel]
             img_original = img_original.cpu().numpy()  #
 
             ##TopK
@@ -208,38 +216,41 @@ def main(args):
                         patch_index_w = int((index[j] - patch_index_h * 12))
                         img_src = img_original[
                             batch_index,
-                            9 * patch_index_h : 9 * (1 + patch_index_h),
-                            9 * patch_index_w : 9 * (1 + patch_index_w),
+                            9 * patch_index_h:9 * (1 + patch_index_h),
+                            9 * patch_index_w:9 * (1 + patch_index_w),
                             :,
                         ]
-                        random_index = int(np.random.randint(0, img.size()[0], 1))
+                        random_index = int(
+                            np.random.randint(0,
+                                              img.size()[0], 1))
                         random_h = int(np.random.randint(0, 12, 1))
                         random_w = int(np.random.randint(0, 12, 1))
                         img_random = img_original[
                             random_index,
-                            9 * random_h : 9 * (1 + random_h),
-                            9 * random_w : 9 * (1 + random_w),
+                            9 * random_h:9 * (1 + random_h),
+                            9 * random_w:9 * (1 + random_w),
                             :,
                         ]
-                        img_src_random = amplitude_spectrum_mix(
-                            img_src, img_random, alpha=1
-                        )
+                        img_src_random = amplitude_spectrum_mix(img_src,
+                                                                img_random,
+                                                                alpha=1)
                         img_original[
                             batch_index,
-                            9 * patch_index_h : 9 * (1 + patch_index_h),
-                            9 * patch_index_w : 9 * (1 + patch_index_w),
+                            9 * patch_index_h:9 * (1 + patch_index_h),
+                            9 * patch_index_w:9 * (1 + patch_index_w),
                             :,
                         ] = img_src_random
                 batch_index = batch_index + 1
 
             img_fft = torch.tensor(img_original).cuda()
-            img_fft = img_fft.permute(0, 3, 1, 2)  ## [batch, channel, height, width]
+            img_fft = img_fft.permute(0, 3, 1,
+                                      2)  ## [batch, channel, height, width]
             img_fft = ((img_fft / 255) - 0.5) / (0.5)
 
             local_embeddings, weight, local_patch_entropy = backbone(img_fft)
-            loss: torch.Tensor = module_partial_fc(
-                local_embeddings, local_labels, opt, local_patch_entropy
-            )
+            loss: torch.Tensor = module_partial_fc(local_embeddings,
+                                                   local_labels, opt,
+                                                   local_patch_entropy)
 
             if cfg.fp16:
                 amp.scale(loss).backward()
@@ -278,9 +289,8 @@ def main(args):
                 "state_optimizer": opt.state_dict(),
                 "state_lr_scheduler": lr_scheduler.state_dict(),
             }
-            torch.save(
-                checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt")
-            )
+            torch.save(checkpoint,
+                       os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
 
         if rank == 0:
             path_module = os.path.join(cfg.output, "model.pt")
@@ -307,8 +317,7 @@ def main(args):
 if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
     parser = argparse.ArgumentParser(
-        description="Distributed Arcface Training in Pytorch"
-    )
+        description="Distributed Arcface Training in Pytorch")
     parser.add_argument(
         "--config",
         type=str,
